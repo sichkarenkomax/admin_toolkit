@@ -4,14 +4,102 @@
 # AdminToolkit - Hardware
 # ============================================================
 
-$Script:LhmInitialized = $false
-$Script:LhmAvailable   = $false
-$Script:LhmError       = $null
+$Script:LhmInitialized     = $false
+$Script:LhmAvailable       = $false
+$Script:LhmError           = $null
+$Script:LhmUserDeclined    = $false
+$Script:LhmInstallChecked  = $false
 
 
 # ============================================================
 # Libre Hardware Monitor
 # ============================================================
+
+function Test-LhmSupportedRuntime {
+
+    # LibreHardwareMonitorLib.dll собран под .NET Framework 4.7.2
+    # и использует перегрузку
+    #   Mutex(Boolean, String, Boolean ByRef, MutexSecurity)
+    # В .NET Core / .NET 5+ такой перегрузки нет, поэтому
+    # Computer.Open() падает с MissingMethodException, и датчики
+    # LHM получить невозможно.
+    #
+    # .NET Framework 4.x сообщает Major = 4,
+    # .NET Core и новее - Major = 5 и выше.
+
+    return ([System.Environment]::Version.Major -lt 5)
+}
+
+
+function Ensure-LhmAvailable {
+
+    if ($Script:LhmInstallChecked) {
+        return (-not $Script:LhmUserDeclined)
+    }
+
+    $Script:LhmInstallChecked = $true
+
+    # Проверяем наличие Libre Hardware Monitor через WinGet.
+    $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+    if (-not $winget) {
+        Write-Host "WinGet не найден. Libre Hardware Monitor не установлен автоматически." -ForegroundColor Yellow
+        return $false
+    }
+
+    try {
+        & $winget.Source list `
+            --id "LibreHardwareMonitor.LibreHardwareMonitor" `
+            -e `
+            --source winget `
+            --accept-source-agreements *> $null
+
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        }
+    }
+    catch {
+        # Если проверка не удалась, предлагаем установку.
+    }
+
+    Write-Host ""
+    Write-Host "Libre Hardware Monitor не установлен." -ForegroundColor Yellow
+    Write-Host "Установить его через WinGet? [Y/N]" -ForegroundColor Cyan
+
+    $answer = Read-Host "Ваш выбор"
+
+    if ($answer -notmatch '^(Y|y|Д|д)$') {
+        $Script:LhmUserDeclined = $true
+        Write-Host "LHM пропущен: пользователь отказался от установки." -ForegroundColor DarkGray
+        return $false
+    }
+
+    try {
+        Write-Host "Установка Libre Hardware Monitor..." -ForegroundColor Cyan
+
+        & $winget.Source install `
+            --id "LibreHardwareMonitor.LibreHardwareMonitor" `
+            -e `
+            --source winget `
+            --accept-source-agreements `
+            --accept-package-agreements
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Libre Hardware Monitor установлен." -ForegroundColor Green
+            return $true
+        }
+
+        $Script:LhmError = "WinGet завершил установку с кодом $LASTEXITCODE."
+        Write-Host "Не удалось установить Libre Hardware Monitor. Команды LHM будут пропущены." -ForegroundColor Yellow
+        return $false
+    }
+    catch {
+        $Script:LhmError = $_.Exception.Message
+        Write-Host "Ошибка установки Libre Hardware Monitor. Команды LHM будут пропущены." -ForegroundColor Yellow
+        return $false
+    }
+}
+
 
 function Initialize-Lhm {
 
@@ -22,6 +110,18 @@ function Initialize-Lhm {
     $Script:LhmInitialized = $true
     $Script:LhmAvailable = $false
     $Script:LhmError = $null
+
+    # Проверка среды выполняется ДО установки LHM, чтобы не
+    # предлагать пользователю ставить библиотеку, которая всё
+    # равно не заработает.
+    if (-not (Test-LhmSupportedRuntime)) {
+        $Script:LhmError = "Libre Hardware Monitor поддерживается только в Windows PowerShell 5.1 (.NET Framework). Запустите AdminToolKit через powershell.exe, а не через pwsh.exe."
+        return $false
+    }
+
+    if (-not (Ensure-LhmAvailable)) {
+        return $false
+    }
 
     $additionalPath = Join-Path $Script:ToolkitRoot "Additional"
 
@@ -56,44 +156,23 @@ function Initialize-Lhm {
     try {
 
         # --------------------------------------------------------
-        # AssemblyResolve для PowerShell 5.1 / .NET Framework
-        # --------------------------------------------------------
-
-        if (-not $Script:LhmAssemblyResolveRegistered) {
-
-            $handler = {
-                param(
-                    [object]$sender,
-                    [System.ResolveEventArgs]$args
-                )
-
-                $requestedName = $args.Name.Split(',')[0]
-                $candidate = Join-Path $additionalPath ($requestedName + ".dll")
-
-                if (Test-Path -LiteralPath $candidate) {
-
-                    try {
-                        return [System.Reflection.Assembly]::LoadFrom(
-                            $candidate
-                        )
-                    }
-                    catch {
-                        return $null
-                    }
-                }
-
-                return $null
-            }
-
-            [System.AppDomain]::CurrentDomain.add_AssemblyResolve($handler)
-
-            $Script:LhmAssemblyResolveHandler = $handler
-            $Script:LhmAssemblyResolveRegistered = $true
-        }
-
-        # --------------------------------------------------------
         # Загрузка библиотек
         # --------------------------------------------------------
+        #
+        # AssemblyResolve намеренно НЕ используется.
+        #
+        # Регистрация обработчика AppDomain.AssemblyResolve,
+        # реализованного скриптблоком PowerShell, приводит к
+        # переполнению стека (0xC00000FD): при автозагрузке модулей
+        # (Microsoft.PowerShell.Storage, MMI, CIM) CLR повторно
+        # входит в обработчик, а тот снова вызывает загрузку сборок.
+        # Воспроизводится даже с пустым телом обработчика.
+        #
+        # Зависимости и так разрешаются: Assembly.LoadFrom ищет
+        # зависимости в каталоге самой загружаемой сборки,
+        # поэтому достаточно загрузить DLL в правильном порядке.
+
+        $loaded = @{}
 
         foreach ($dll in $dlls) {
 
@@ -103,18 +182,19 @@ function Initialize-Lhm {
             $alreadyLoaded = [System.AppDomain]::CurrentDomain.GetAssemblies() |
                 Where-Object {
                     $_.GetName().Name -eq $assemblyName
-                }
+                } |
+                Select-Object -First 1
 
-            if (-not $alreadyLoaded) {
-                [void][System.Reflection.Assembly]::LoadFrom($path)
+            if ($alreadyLoaded) {
+                $loaded[$assemblyName] = $alreadyLoaded
+            }
+            else {
+                $loaded[$assemblyName] =
+                    [System.Reflection.Assembly]::LoadFrom($path)
             }
         }
 
-        $lhmAssembly = [System.AppDomain]::CurrentDomain.GetAssemblies() |
-            Where-Object {
-                $_.GetName().Name -eq "LibreHardwareMonitorLib"
-            } |
-            Select-Object -First 1
+        $lhmAssembly = $loaded["LibreHardwareMonitorLib"]
 
         if (-not $lhmAssembly) {
             throw "LibreHardwareMonitorLib не загружена."
@@ -144,6 +224,10 @@ function Initialize-Lhm {
 
 
 function Get-LhmData {
+
+    if ($Script:LhmUserDeclined) {
+        return @()
+    }
 
     if (-not (Initialize-Lhm)) {
         return @()
@@ -924,7 +1008,11 @@ function Show-HardwareStatus {
     Write-Host "LIBRE HARDWARE MONITOR" -ForegroundColor Cyan
     Write-Host "────────────────────────────────────────────────────────────"
 
-    if ($data.LhmAvailable) {
+    if ($Script:LhmUserDeclined) {
+
+        Show-Info "LHM пропущен: пользователь отказался от установки Libre Hardware Monitor."
+    }
+    elseif ($data.LhmAvailable) {
 
         Show-Success "LHM доступен. Дополнительные датчики получены."
 
@@ -955,10 +1043,14 @@ function Show-HardwareStatus {
     }
     else {
 
-        Show-Info "Libre Hardware Monitor недоступен."
-
         if ($data.LhmError) {
-            Write-Host "Причина: $($data.LhmError)" -ForegroundColor DarkGray
+
+            Show-Warning "Libre Hardware Monitor недоступен."
+            Write-Host "Причина: $($data.LhmError)" -ForegroundColor Yellow
+        }
+        else {
+
+            Show-Info "Libre Hardware Monitor недоступен."
         }
     }
 }
